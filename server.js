@@ -12,42 +12,6 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Rate limiting middleware
-const requestCounts = new Map();
-const RATE_LIMIT = 100;
-const RATE_WINDOW = 60 * 60 * 1000;
-
-function rateLimitMiddleware(req, res, next) {
-  const ip = req.ip || req.connection.remoteAddress;
-  const now = Date.now();
-  
-  if (!requestCounts.has(ip)) {
-    requestCounts.set(ip, { count: 1, resetTime: now + RATE_WINDOW });
-    return next();
-  }
-  
-  const record = requestCounts.get(ip);
-  
-  if (now > record.resetTime) {
-    record.count = 1;
-    record.resetTime = now + RATE_WINDOW;
-    return next();
-  }
-  
-  if (record.count >= RATE_LIMIT) {
-    return res.status(429).json({
-      success: false,
-      message: 'Too many requests. Please try again later.'
-    });
-  }
-  
-  record.count++;
-  next();
-}
-
-app.use('/api/activate-license', rateLimitMiddleware);
-app.use('/api/check-license', rateLimitMiddleware);
-
 // ============================================
 // CONFIGURATION
 // ============================================
@@ -58,14 +22,12 @@ const PAYOS_CONFIG = {
 };
 
 const PORT = process.env.PORT || 3000;
-const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || 'your-secret-encryption-key-32-chars!!';
 
 // ============================================
 // IN-MEMORY DATABASES
 // ============================================
 const licenses = new Map();
 const payments = new Map();
-const activationAttempts = new Map();
 
 // ============================================
 // HELPER FUNCTIONS
@@ -93,30 +55,6 @@ function hashDeviceId(deviceId) {
   return crypto.createHash('sha256').update(deviceId).digest('hex');
 }
 
-function checkActivationAttempts(ip) {
-  const now = Date.now();
-  
-  if (!activationAttempts.has(ip)) {
-    activationAttempts.set(ip, { count: 1, resetTime: now + 3600000 });
-    return true;
-  }
-  
-  const record = activationAttempts.get(ip);
-  
-  if (now > record.resetTime) {
-    record.count = 1;
-    record.resetTime = now + 3600000;
-    return true;
-  }
-  
-  if (record.count >= 10) {
-    return false;
-  }
-  
-  record.count++;
-  return true;
-}
-
 // ============================================
 // ROUTES
 // ============================================
@@ -126,25 +64,75 @@ app.get('/', (req, res) => {
   res.json({
     status: 'running',
     message: '✅ Backend đang hoạt động',
-    version: '2.1.0',
-    endpoints: {
-      createPayment: 'POST /api/create-payment',
-      webhook: 'POST /api/payos-webhook',
-      getLicense: 'GET /api/get-license/:orderId',
-      paymentSuccess: 'GET /api/payment-success'
-    }
+    version: '2.2.0'
   });
 });
 
 // ============================================
-// PAYMENT SUCCESS PAGE
+// PAYMENT SUCCESS PAGE - XỬ LÝ RETURN URL
 // ============================================
 app.get('/api/payment-success', (req, res) => {
+  // Lấy query params từ PayOS return URL
+  const { code, status, orderCode, id, cancel } = req.query;
+  
+  console.log('🔔 ========== PAYMENT RETURN ==========');
+  console.log('Code:', code);
+  console.log('Status:', status);
+  console.log('OrderCode:', orderCode);
+  console.log('Cancel:', cancel);
+  
+  // Kiểm tra thanh toán thành công
+  // code=00 và status=PAID nghĩa là thành công
+  if (code === '00' && status === 'PAID' && orderCode) {
+    console.log('✅ Payment SUCCESS!');
+    
+    // Tìm hoặc tạo payment record
+    let payment = payments.get(orderCode.toString());
+    
+    if (!payment) {
+      payment = {
+        orderId: orderCode,
+        status: 'pending',
+        createdAt: new Date().toISOString(),
+        licenseKey: null
+      };
+    }
+    
+    // Tạo license nếu chưa có
+    if (payment.status !== 'completed') {
+      const licenseKey = generateLicenseKey();
+      const expiryDate = new Date();
+      expiryDate.setFullYear(expiryDate.getFullYear() + 1);
+      
+      // Lưu license
+      licenses.set(licenseKey, {
+        key: licenseKey,
+        orderId: orderCode,
+        status: 'active',
+        createdAt: new Date().toISOString(),
+        expiryDate: expiryDate.toISOString(),
+        deviceId: null
+      });
+      
+      // Update payment
+      payment.status = 'completed';
+      payment.licenseKey = licenseKey;
+      payment.completedAt = new Date().toISOString();
+      payments.set(orderCode.toString(), payment);
+      
+      console.log(`🔑 License created: ${licenseKey}`);
+    }
+  }
+  
+  // Hiển thị trang kết quả
+  const isSuccess = code === '00' && status === 'PAID';
+  const isCancelled = cancel === 'true' || status === 'CANCELLED';
+  
   res.send(`
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Thanh toán thành công</title>
+        <title>${isSuccess ? 'Thanh toán thành công' : 'Thanh toán'}</title>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <style>
@@ -152,7 +140,7 @@ app.get('/api/payment-success', (req, res) => {
             body { 
                 font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; 
                 text-align: center; 
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                background: linear-gradient(135deg, ${isSuccess ? '#667eea' : '#ef4444'} 0%, ${isSuccess ? '#764ba2' : '#dc2626'} 100%);
                 min-height: 100vh;
                 display: flex;
                 align-items: center;
@@ -168,7 +156,7 @@ app.get('/api/payment-success', (req, res) => {
                 box-shadow: 0 20px 60px rgba(0,0,0,0.3);
             }
             .icon { font-size: 80px; margin-bottom: 20px; }
-            h1 { color: #10b981; margin-bottom: 16px; font-size: 28px; }
+            h1 { color: ${isSuccess ? '#10b981' : '#ef4444'}; margin-bottom: 16px; font-size: 28px; }
             p { font-size: 16px; margin-bottom: 12px; color: #555; line-height: 1.6; }
             .highlight { font-weight: 600; color: #333; }
             .note { font-size: 14px; color: #888; margin-top: 24px; padding-top: 20px; border-top: 1px solid #eee; }
@@ -183,15 +171,30 @@ app.get('/api/payment-success', (req, res) => {
                 font-weight: 600;
                 cursor: pointer;
             }
+            .order-code { 
+                background: #f3f4f6; 
+                padding: 10px 20px; 
+                border-radius: 8px; 
+                font-family: monospace;
+                margin: 16px 0;
+            }
         </style>
     </head>
     <body>
         <div class="container">
-            <div class="icon">✅</div>
-            <h1>Thanh toán thành công!</h1>
-            <p>Cảm ơn bạn đã nâng cấp <span class="highlight">Premium</span>.</p>
-            <p class="highlight">Bạn có thể đóng tab này.</p>
-            <p class="note">Extension sẽ tự động kích hoạt Premium trong vài giây.</p>
+            <div class="icon">${isSuccess ? '✅' : (isCancelled ? '❌' : '⏳')}</div>
+            <h1>${isSuccess ? 'Thanh toán thành công!' : (isCancelled ? 'Đã hủy thanh toán' : 'Đang xử lý...')}</h1>
+            ${isSuccess ? `
+                <p>Cảm ơn bạn đã nâng cấp <span class="highlight">Premium</span>.</p>
+                <div class="order-code">Mã đơn: ${orderCode}</div>
+                <p class="highlight">Bạn có thể đóng tab này.</p>
+                <p class="note">Extension sẽ tự động kích hoạt Premium trong vài giây.</p>
+            ` : (isCancelled ? `
+                <p>Bạn đã hủy thanh toán.</p>
+                <p>Vui lòng thử lại nếu muốn nâng cấp Premium.</p>
+            ` : `
+                <p>Đang xử lý thanh toán của bạn...</p>
+            `)}
             <button class="close-btn" onclick="window.close()">Đóng tab này</button>
         </div>
     </body>
@@ -204,25 +207,28 @@ app.get('/api/payment-success', (req, res) => {
 // ============================================
 app.post('/api/create-payment', async (req, res) => {
   try {
-    console.log('📥 Nhận request tạo thanh toán:', req.body);
+    console.log('📥 Create payment:', req.body);
     
     const { productName, price, returnUrl, cancelUrl } = req.body;
     
     if (!productName || !price) {
       return res.status(400).json({
         success: false,
-        message: 'Thiếu thông tin sản phẩm hoặc giá'
+        message: 'Thiếu thông tin'
       });
     }
     
     const orderCode = Date.now();
     
+    // Return URL về backend để xử lý
+    const backendReturnUrl = `https://packing-backend-pndo.onrender.com/api/payment-success`;
+    
     const paymentData = {
       orderCode: orderCode,
       amount: price,
-      description: productName.substring(0, 25), // PayOS giới hạn 25 ký tự
-      returnUrl: returnUrl || `https://packing-backend-pndo.onrender.com/api/payment-success`,
-      cancelUrl: cancelUrl || `https://packing-backend-pndo.onrender.com/api/payment-success`,
+      description: productName.substring(0, 25),
+      returnUrl: backendReturnUrl,
+      cancelUrl: backendReturnUrl,
       signature: ''
     };
     
@@ -235,8 +241,6 @@ app.post('/api/create-payment', async (req, res) => {
       returnUrl: paymentData.returnUrl
     };
     paymentData.signature = generateSignature(signatureData);
-    
-    console.log('📤 Gửi request đến PayOS:', paymentData);
     
     // Call PayOS API
     const payosResponse = await axios.post(
@@ -253,7 +257,7 @@ app.post('/api/create-payment', async (req, res) => {
     
     console.log('✅ PayOS response:', payosResponse.data);
     
-    // Store payment data
+    // Store payment
     payments.set(orderCode.toString(), {
       orderId: orderCode,
       status: 'pending',
@@ -267,72 +271,49 @@ app.post('/api/create-payment', async (req, res) => {
       success: true,
       checkoutUrl: payosResponse.data.data.checkoutUrl,
       orderId: orderCode,
-      message: 'Tạo link thanh toán thành công'
+      message: 'OK'
     });
     
   } catch (error) {
-    console.error('❌ Lỗi tạo thanh toán:', error.response?.data || error.message);
+    console.error('❌ Error:', error.response?.data || error.message);
     res.status(500).json({
       success: false,
-      message: 'Không thể tạo link thanh toán',
-      error: error.response?.data?.message || error.message
+      message: error.response?.data?.message || error.message
     });
   }
 });
 
 // ============================================
-// PAYOS WEBHOOK - QUAN TRỌNG!
+// PAYOS WEBHOOK (POST)
 // ============================================
 app.post('/api/payos-webhook', async (req, res) => {
   try {
-    console.log('🔔 ========== WEBHOOK RECEIVED ==========');
-    console.log('🔔 Full body:', JSON.stringify(req.body, null, 2));
+    console.log('🔔 Webhook received:', JSON.stringify(req.body, null, 2));
     
-    // PayOS gửi data trong req.body với structure:
-    // { code: "00", desc: "success", success: true, data: {...}, signature: "..." }
+    const { code, success, data } = req.body;
     
-    const webhookBody = req.body;
-    const code = webhookBody.code;
-    const success = webhookBody.success;
-    const webhookData = webhookBody.data;
-    const signature = webhookBody.signature;
-    
-    console.log('🔔 Code:', code);
-    console.log('🔔 Success:', success);
-    console.log('🔔 Data:', webhookData);
-    
-    // Kiểm tra thanh toán thành công
-    // PayOS trả về code "00" khi thành công
-    if (code === '00' && success === true && webhookData) {
+    if (code === '00' && success === true && data) {
+      const orderCode = data.orderCode?.toString();
       
-      const orderCode = webhookData.orderCode?.toString();
-      const amount = webhookData.amount;
+      console.log(`✅ Webhook: Payment SUCCESS for order ${orderCode}`);
       
-      console.log(`✅ Payment SUCCESS! Order: ${orderCode}, Amount: ${amount}`);
-      
-      // Tìm payment trong database
       let payment = payments.get(orderCode);
       
-      // Nếu không tìm thấy, tạo mới (trường hợp webhook đến trước polling)
       if (!payment) {
-        console.log('⚠️ Payment not found, creating new entry');
         payment = {
           orderId: orderCode,
           status: 'pending',
-          amount: amount,
+          amount: data.amount,
           createdAt: new Date().toISOString(),
           licenseKey: null
         };
       }
       
-      // Chỉ xử lý nếu chưa completed
       if (payment.status !== 'completed') {
-        // Tạo license key
         const licenseKey = generateLicenseKey();
         const expiryDate = new Date();
-        expiryDate.setFullYear(expiryDate.getFullYear() + 1); // 1 năm
+        expiryDate.setFullYear(expiryDate.getFullYear() + 1);
         
-        // Lưu license
         licenses.set(licenseKey, {
           key: licenseKey,
           orderId: orderCode,
@@ -342,166 +323,123 @@ app.post('/api/payos-webhook', async (req, res) => {
           deviceId: null
         });
         
-        // Update payment
         payment.status = 'completed';
         payment.licenseKey = licenseKey;
         payment.completedAt = new Date().toISOString();
-        payment.payosData = webhookData;
         payments.set(orderCode, payment);
         
-        console.log(`🔑 License created: ${licenseKey}`);
-        console.log(`📅 Expiry: ${expiryDate.toISOString()}`);
-      } else {
-        console.log('ℹ️ Payment already completed, skipping');
+        console.log(`🔑 License created via webhook: ${licenseKey}`);
       }
-    } else {
-      console.log('⚠️ Payment not successful or missing data');
-      console.log('   Code:', code);
-      console.log('   Success:', success);
     }
     
-    // Luôn trả về success cho PayOS
-    console.log('🔔 ========== WEBHOOK END ==========');
     res.json({ success: true });
     
   } catch (error) {
     console.error('❌ Webhook error:', error);
-    // Vẫn trả về 200 để PayOS không retry
-    res.json({ success: true, error: error.message });
+    res.json({ success: true });
   }
 });
 
 // ============================================
-// GET LICENSE BY ORDER ID (Extension polling)
+// GET LICENSE BY ORDER ID
 // ============================================
 app.get('/api/get-license/:orderId', (req, res) => {
-  try {
-    const { orderId } = req.params;
-    console.log('🔍 Get license for order:', orderId);
-    
-    const payment = payments.get(orderId);
-    
-    console.log('📦 Payment found:', payment);
-    
-    if (!payment) {
-      return res.json({
-        success: false,
-        status: 'not_found',
-        message: 'Đang chờ xác nhận thanh toán...'
-      });
-    }
-    
-    if (payment.status === 'pending') {
-      return res.json({
-        success: false,
-        status: 'pending',
-        message: 'Đang chờ thanh toán...'
-      });
-    }
-    
-    if (payment.status === 'completed' && payment.licenseKey) {
-      const license = licenses.get(payment.licenseKey);
-      
-      console.log('✅ Returning license:', payment.licenseKey);
-      
-      return res.json({
-        success: true,
-        status: 'completed',
-        licenseKey: payment.licenseKey,
-        expiryDate: license?.expiryDate,
-        message: 'Thanh toán thành công!'
-      });
-    }
-    
+  const { orderId } = req.params;
+  console.log('🔍 Get license:', orderId);
+  
+  const payment = payments.get(orderId);
+  console.log('Payment:', payment);
+  
+  if (!payment) {
     return res.json({
       success: false,
-      status: 'unknown',
-      message: 'Trạng thái không xác định'
-    });
-    
-  } catch (error) {
-    console.error('❌ Get license error:', error);
-    res.status(500).json({
-      success: false,
-      message: error.message
+      status: 'not_found',
+      message: 'Đang chờ...'
     });
   }
+  
+  if (payment.status === 'pending') {
+    return res.json({
+      success: false,
+      status: 'pending',
+      message: 'Đang chờ thanh toán...'
+    });
+  }
+  
+  if (payment.status === 'completed' && payment.licenseKey) {
+    const license = licenses.get(payment.licenseKey);
+    
+    return res.json({
+      success: true,
+      status: 'completed',
+      licenseKey: payment.licenseKey,
+      expiryDate: license?.expiryDate,
+      message: 'OK'
+    });
+  }
+  
+  return res.json({
+    success: false,
+    status: 'unknown'
+  });
 });
 
 // ============================================
-// ACTIVATE LICENSE (Manual key input)
+// ACTIVATE LICENSE (Manual)
 // ============================================
 app.post('/api/activate-license', (req, res) => {
-  try {
-    const ip = req.ip || req.connection.remoteAddress;
-    
-    if (!checkActivationAttempts(ip)) {
-      return res.status(429).json({
-        success: false,
-        message: 'Quá nhiều lần thử. Vui lòng thử lại sau 1 giờ.'
-      });
-    }
-    
-    const { licenseKey, deviceId } = req.body;
-    
-    if (!licenseKey) {
-      return res.status(400).json({
-        success: false,
-        message: 'Vui lòng nhập mã kích hoạt'
-      });
-    }
-    
-    const trimmedKey = licenseKey.trim().toUpperCase();
-    const license = licenses.get(trimmedKey);
-    
-    if (!license) {
-      return res.status(404).json({
-        success: false,
-        message: 'Mã kích hoạt không hợp lệ'
-      });
-    }
-    
-    if (new Date(license.expiryDate) < new Date()) {
-      return res.status(400).json({
-        success: false,
-        message: 'Mã kích hoạt đã hết hạn'
-      });
-    }
-    
-    if (license.status === 'used' && deviceId) {
-      const hashedDeviceId = hashDeviceId(deviceId);
-      if (license.deviceId && license.deviceId !== hashedDeviceId) {
-        return res.status(400).json({
-          success: false,
-          message: 'Mã đã được sử dụng trên thiết bị khác'
-        });
-      }
-    }
-    
-    // Activate
-    if (deviceId) {
-      license.deviceId = hashDeviceId(deviceId);
-    }
-    license.status = 'used';
-    license.activatedAt = new Date().toISOString();
-    licenses.set(trimmedKey, license);
-    
-    res.json({
-      success: true,
-      message: 'Kích hoạt thành công!',
-      expiryDate: license.expiryDate
-    });
-    
-  } catch (error) {
-    res.status(500).json({
+  const { licenseKey, deviceId } = req.body;
+  
+  if (!licenseKey) {
+    return res.status(400).json({
       success: false,
-      message: 'Lỗi hệ thống'
+      message: 'Vui lòng nhập mã kích hoạt'
     });
   }
+  
+  const trimmedKey = licenseKey.trim().toUpperCase();
+  const license = licenses.get(trimmedKey);
+  
+  if (!license) {
+    return res.status(404).json({
+      success: false,
+      message: 'Mã không hợp lệ'
+    });
+  }
+  
+  if (new Date(license.expiryDate) < new Date()) {
+    return res.status(400).json({
+      success: false,
+      message: 'Mã đã hết hạn'
+    });
+  }
+  
+  if (license.status === 'used' && deviceId) {
+    const hashedDeviceId = hashDeviceId(deviceId);
+    if (license.deviceId && license.deviceId !== hashedDeviceId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Mã đã dùng trên thiết bị khác'
+      });
+    }
+  }
+  
+  if (deviceId) {
+    license.deviceId = hashDeviceId(deviceId);
+  }
+  license.status = 'used';
+  license.activatedAt = new Date().toISOString();
+  licenses.set(trimmedKey, license);
+  
+  res.json({
+    success: true,
+    message: 'OK',
+    expiryDate: license.expiryDate
+  });
 });
 
 // ============================================
-// ADMIN - View all data (for debugging)
+// DEBUG
 // ============================================
 app.get('/api/admin/debug', (req, res) => {
   res.json({
@@ -515,14 +453,5 @@ app.get('/api/admin/debug', (req, res) => {
 // START SERVER
 // ============================================
 app.listen(PORT, () => {
-  console.log('\n🚀 ==========================================');
-  console.log(`✅ Server running on port ${PORT}`);
-  console.log(`📍 URL: https://packing-backend-pndo.onrender.com`);
-  console.log('\n📝 Endpoints:');
-  console.log('   POST /api/create-payment');
-  console.log('   POST /api/payos-webhook');
-  console.log('   GET  /api/get-license/:orderId');
-  console.log('   GET  /api/payment-success');
-  console.log('   GET  /api/admin/debug');
-  console.log('==========================================\n');
+  console.log(`🚀 Server running on port ${PORT}`);
 });
