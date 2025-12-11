@@ -26,8 +26,9 @@ const PORT = process.env.PORT || 3000;
 // ============================================
 // IN-MEMORY DATABASES
 // ============================================
-const licenses = new Map();
-const payments = new Map();
+const licenses = new Map();      // licenseKey -> license data
+const payments = new Map();      // orderId -> payment data
+const deviceLicenses = new Map(); // deviceId -> licenseKey (để khôi phục khi cài lại)
 
 // ============================================
 // HELPER FUNCTIONS
@@ -64,29 +65,20 @@ app.get('/', (req, res) => {
   res.json({
     status: 'running',
     message: '✅ Backend đang hoạt động',
-    version: '2.2.0'
+    version: '3.0.0'
   });
 });
 
 // ============================================
-// PAYMENT SUCCESS PAGE - XỬ LÝ RETURN URL
+// PAYMENT SUCCESS PAGE
 // ============================================
 app.get('/api/payment-success', (req, res) => {
-  // Lấy query params từ PayOS return URL
-  const { code, status, orderCode, id, cancel } = req.query;
+  const { code, status, orderCode, cancel } = req.query;
   
-  console.log('🔔 ========== PAYMENT RETURN ==========');
-  console.log('Code:', code);
-  console.log('Status:', status);
-  console.log('OrderCode:', orderCode);
-  console.log('Cancel:', cancel);
+  console.log('🔔 Payment return:', { code, status, orderCode, cancel });
   
-  // Kiểm tra thanh toán thành công
-  // code=00 và status=PAID nghĩa là thành công
+  // Xử lý thanh toán thành công
   if (code === '00' && status === 'PAID' && orderCode) {
-    console.log('✅ Payment SUCCESS!');
-    
-    // Tìm hoặc tạo payment record
     let payment = payments.get(orderCode.toString());
     
     if (!payment) {
@@ -98,13 +90,11 @@ app.get('/api/payment-success', (req, res) => {
       };
     }
     
-    // Tạo license nếu chưa có
     if (payment.status !== 'completed') {
       const licenseKey = generateLicenseKey();
       const expiryDate = new Date();
       expiryDate.setFullYear(expiryDate.getFullYear() + 1);
       
-      // Lưu license
       licenses.set(licenseKey, {
         key: licenseKey,
         orderId: orderCode,
@@ -114,7 +104,6 @@ app.get('/api/payment-success', (req, res) => {
         deviceId: null
       });
       
-      // Update payment
       payment.status = 'completed';
       payment.licenseKey = licenseKey;
       payment.completedAt = new Date().toISOString();
@@ -124,7 +113,6 @@ app.get('/api/payment-success', (req, res) => {
     }
   }
   
-  // Hiển thị trang kết quả
   const isSuccess = code === '00' && status === 'PAID';
   const isCancelled = cancel === 'true' || status === 'CANCELLED';
   
@@ -158,26 +146,8 @@ app.get('/api/payment-success', (req, res) => {
             .icon { font-size: 80px; margin-bottom: 20px; }
             h1 { color: ${isSuccess ? '#10b981' : '#ef4444'}; margin-bottom: 16px; font-size: 28px; }
             p { font-size: 16px; margin-bottom: 12px; color: #555; line-height: 1.6; }
-            .highlight { font-weight: 600; color: #333; }
-            .note { font-size: 14px; color: #888; margin-top: 24px; padding-top: 20px; border-top: 1px solid #eee; }
-            .close-btn {
-                margin-top: 24px;
-                padding: 14px 40px;
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                color: white;
-                border: none;
-                border-radius: 12px;
-                font-size: 16px;
-                font-weight: 600;
-                cursor: pointer;
-            }
-            .order-code { 
-                background: #f3f4f6; 
-                padding: 10px 20px; 
-                border-radius: 8px; 
-                font-family: monospace;
-                margin: 16px 0;
-            }
+            .order-code { background: #f3f4f6; padding: 10px 20px; border-radius: 8px; font-family: monospace; margin: 16px 0; }
+            .close-btn { margin-top: 24px; padding: 14px 40px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border: none; border-radius: 12px; font-size: 16px; cursor: pointer; }
         </style>
     </head>
     <body>
@@ -185,16 +155,11 @@ app.get('/api/payment-success', (req, res) => {
             <div class="icon">${isSuccess ? '✅' : (isCancelled ? '❌' : '⏳')}</div>
             <h1>${isSuccess ? 'Thanh toán thành công!' : (isCancelled ? 'Đã hủy thanh toán' : 'Đang xử lý...')}</h1>
             ${isSuccess ? `
-                <p>Cảm ơn bạn đã nâng cấp <span class="highlight">Premium</span>.</p>
+                <p>Cảm ơn bạn đã nâng cấp <strong>Premium</strong>.</p>
                 <div class="order-code">Mã đơn: ${orderCode}</div>
-                <p class="highlight">Bạn có thể đóng tab này.</p>
-                <p class="note">Extension sẽ tự động kích hoạt Premium trong vài giây.</p>
-            ` : (isCancelled ? `
-                <p>Bạn đã hủy thanh toán.</p>
-                <p>Vui lòng thử lại nếu muốn nâng cấp Premium.</p>
-            ` : `
-                <p>Đang xử lý thanh toán của bạn...</p>
-            `)}
+                <p><strong>Bạn có thể đóng tab này.</strong></p>
+                <p style="font-size: 14px; color: #888;">Extension sẽ tự động kích hoạt Premium.</p>
+            ` : `<p>Vui lòng thử lại.</p>`}
             <button class="close-btn" onclick="window.close()">Đóng tab này</button>
         </div>
     </body>
@@ -203,28 +168,21 @@ app.get('/api/payment-success', (req, res) => {
 });
 
 // ============================================
-// CREATE PAYMENT LINK
+// CREATE PAYMENT
 // ============================================
 app.post('/api/create-payment', async (req, res) => {
   try {
-    console.log('📥 Create payment:', req.body);
-    
-    const { productName, price, returnUrl, cancelUrl } = req.body;
+    const { productName, price } = req.body;
     
     if (!productName || !price) {
-      return res.status(400).json({
-        success: false,
-        message: 'Thiếu thông tin'
-      });
+      return res.status(400).json({ success: false, message: 'Missing info' });
     }
     
     const orderCode = Date.now();
-    
-    // Return URL về backend để xử lý
     const backendReturnUrl = `https://packing-backend-pndo.onrender.com/api/payment-success`;
     
     const paymentData = {
-      orderCode: orderCode,
+      orderCode,
       amount: price,
       description: productName.substring(0, 25),
       returnUrl: backendReturnUrl,
@@ -232,7 +190,6 @@ app.post('/api/create-payment', async (req, res) => {
       signature: ''
     };
     
-    // Generate signature
     const signatureData = {
       amount: paymentData.amount,
       cancelUrl: paymentData.cancelUrl,
@@ -242,7 +199,6 @@ app.post('/api/create-payment', async (req, res) => {
     };
     paymentData.signature = generateSignature(signatureData);
     
-    // Call PayOS API
     const payosResponse = await axios.post(
       'https://api-merchant.payos.vn/v2/payment-requests',
       paymentData,
@@ -255,14 +211,10 @@ app.post('/api/create-payment', async (req, res) => {
       }
     );
     
-    console.log('✅ PayOS response:', payosResponse.data);
-    
-    // Store payment
     payments.set(orderCode.toString(), {
       orderId: orderCode,
       status: 'pending',
       amount: price,
-      productName: productName,
       createdAt: new Date().toISOString(),
       licenseKey: null
     });
@@ -270,74 +222,54 @@ app.post('/api/create-payment', async (req, res) => {
     res.json({
       success: true,
       checkoutUrl: payosResponse.data.data.checkoutUrl,
-      orderId: orderCode,
-      message: 'OK'
+      orderId: orderCode
     });
     
   } catch (error) {
-    console.error('❌ Error:', error.response?.data || error.message);
-    res.status(500).json({
-      success: false,
-      message: error.response?.data?.message || error.message
-    });
+    console.error('Payment error:', error.response?.data || error.message);
+    res.status(500).json({ success: false, message: error.message });
   }
 });
 
 // ============================================
-// PAYOS WEBHOOK (POST)
+// PAYOS WEBHOOK
 // ============================================
-app.post('/api/payos-webhook', async (req, res) => {
-  try {
-    console.log('🔔 Webhook received:', JSON.stringify(req.body, null, 2));
+app.post('/api/payos-webhook', (req, res) => {
+  console.log('🔔 Webhook:', JSON.stringify(req.body, null, 2));
+  
+  const { code, success, data } = req.body;
+  
+  if (code === '00' && success === true && data) {
+    const orderCode = data.orderCode?.toString();
     
-    const { code, success, data } = req.body;
-    
-    if (code === '00' && success === true && data) {
-      const orderCode = data.orderCode?.toString();
-      
-      console.log(`✅ Webhook: Payment SUCCESS for order ${orderCode}`);
-      
-      let payment = payments.get(orderCode);
-      
-      if (!payment) {
-        payment = {
-          orderId: orderCode,
-          status: 'pending',
-          amount: data.amount,
-          createdAt: new Date().toISOString(),
-          licenseKey: null
-        };
-      }
-      
-      if (payment.status !== 'completed') {
-        const licenseKey = generateLicenseKey();
-        const expiryDate = new Date();
-        expiryDate.setFullYear(expiryDate.getFullYear() + 1);
-        
-        licenses.set(licenseKey, {
-          key: licenseKey,
-          orderId: orderCode,
-          status: 'active',
-          createdAt: new Date().toISOString(),
-          expiryDate: expiryDate.toISOString(),
-          deviceId: null
-        });
-        
-        payment.status = 'completed';
-        payment.licenseKey = licenseKey;
-        payment.completedAt = new Date().toISOString();
-        payments.set(orderCode, payment);
-        
-        console.log(`🔑 License created via webhook: ${licenseKey}`);
-      }
+    let payment = payments.get(orderCode);
+    if (!payment) {
+      payment = { orderId: orderCode, status: 'pending', createdAt: new Date().toISOString(), licenseKey: null };
     }
     
-    res.json({ success: true });
-    
-  } catch (error) {
-    console.error('❌ Webhook error:', error);
-    res.json({ success: true });
+    if (payment.status !== 'completed') {
+      const licenseKey = generateLicenseKey();
+      const expiryDate = new Date();
+      expiryDate.setFullYear(expiryDate.getFullYear() + 1);
+      
+      licenses.set(licenseKey, {
+        key: licenseKey,
+        orderId: orderCode,
+        status: 'active',
+        createdAt: new Date().toISOString(),
+        expiryDate: expiryDate.toISOString(),
+        deviceId: null
+      });
+      
+      payment.status = 'completed';
+      payment.licenseKey = licenseKey;
+      payments.set(orderCode, payment);
+      
+      console.log(`🔑 License via webhook: ${licenseKey}`);
+    }
   }
+  
+  res.json({ success: true });
 });
 
 // ============================================
@@ -345,97 +277,133 @@ app.post('/api/payos-webhook', async (req, res) => {
 // ============================================
 app.get('/api/get-license/:orderId', (req, res) => {
   const { orderId } = req.params;
-  console.log('🔍 Get license:', orderId);
-  
   const payment = payments.get(orderId);
-  console.log('Payment:', payment);
   
   if (!payment) {
-    return res.json({
-      success: false,
-      status: 'not_found',
-      message: 'Đang chờ...'
-    });
-  }
-  
-  if (payment.status === 'pending') {
-    return res.json({
-      success: false,
-      status: 'pending',
-      message: 'Đang chờ thanh toán...'
-    });
+    return res.json({ success: false, status: 'not_found' });
   }
   
   if (payment.status === 'completed' && payment.licenseKey) {
     const license = licenses.get(payment.licenseKey);
-    
     return res.json({
       success: true,
       status: 'completed',
       licenseKey: payment.licenseKey,
-      expiryDate: license?.expiryDate,
-      message: 'OK'
+      expiryDate: license?.expiryDate
     });
   }
   
-  return res.json({
-    success: false,
-    status: 'unknown'
+  res.json({ success: false, status: payment.status });
+});
+
+// ============================================
+// BIND DEVICE TO LICENSE (Sau khi thanh toán thành công)
+// ============================================
+app.post('/api/bind-device', (req, res) => {
+  const { licenseKey, deviceId } = req.body;
+  
+  if (!licenseKey || !deviceId) {
+    return res.status(400).json({ success: false, message: 'Missing data' });
+  }
+  
+  const license = licenses.get(licenseKey);
+  if (!license) {
+    return res.status(404).json({ success: false, message: 'License not found' });
+  }
+  
+  // Hash device ID
+  const hashedDeviceId = hashDeviceId(deviceId);
+  
+  // Bind device to license
+  license.deviceId = hashedDeviceId;
+  licenses.set(licenseKey, license);
+  
+  // Lưu mapping deviceId -> licenseKey để khôi phục khi cài lại
+  deviceLicenses.set(hashedDeviceId, licenseKey);
+  
+  console.log(`🔗 Device bound: ${hashedDeviceId.substring(0, 16)}... -> ${licenseKey}`);
+  
+  res.json({ success: true, message: 'Device bound' });
+});
+
+// ============================================
+// CHECK DEVICE LICENSE (Khôi phục khi cài lại extension)
+// ============================================
+app.post('/api/check-device-license', (req, res) => {
+  const { deviceId } = req.body;
+  
+  if (!deviceId) {
+    return res.json({ success: false, valid: false, message: 'No device ID' });
+  }
+  
+  const hashedDeviceId = hashDeviceId(deviceId);
+  const licenseKey = deviceLicenses.get(hashedDeviceId);
+  
+  if (!licenseKey) {
+    return res.json({ success: false, valid: false, message: 'No license for this device' });
+  }
+  
+  const license = licenses.get(licenseKey);
+  
+  if (!license) {
+    return res.json({ success: false, valid: false, message: 'License not found' });
+  }
+  
+  // Check expiry
+  if (new Date(license.expiryDate) < new Date()) {
+    return res.json({ success: false, valid: false, message: 'License expired' });
+  }
+  
+  console.log(`✅ License restored for device: ${hashedDeviceId.substring(0, 16)}...`);
+  
+  res.json({
+    success: true,
+    valid: true,
+    licenseKey: licenseKey,
+    expiryDate: license.expiryDate,
+    message: 'License valid'
   });
 });
 
 // ============================================
-// ACTIVATE LICENSE (Manual)
+// ACTIVATE LICENSE (Manual key input)
 // ============================================
 app.post('/api/activate-license', (req, res) => {
   const { licenseKey, deviceId } = req.body;
   
   if (!licenseKey) {
-    return res.status(400).json({
-      success: false,
-      message: 'Vui lòng nhập mã kích hoạt'
-    });
+    return res.status(400).json({ success: false, message: 'Vui lòng nhập mã' });
   }
   
   const trimmedKey = licenseKey.trim().toUpperCase();
   const license = licenses.get(trimmedKey);
   
   if (!license) {
-    return res.status(404).json({
-      success: false,
-      message: 'Mã không hợp lệ'
-    });
+    return res.status(404).json({ success: false, message: 'Mã không hợp lệ' });
   }
   
   if (new Date(license.expiryDate) < new Date()) {
-    return res.status(400).json({
-      success: false,
-      message: 'Mã đã hết hạn'
-    });
+    return res.status(400).json({ success: false, message: 'Mã đã hết hạn' });
   }
   
-  if (license.status === 'used' && deviceId) {
-    const hashedDeviceId = hashDeviceId(deviceId);
-    if (license.deviceId && license.deviceId !== hashedDeviceId) {
-      return res.status(400).json({
-        success: false,
-        message: 'Mã đã dùng trên thiết bị khác'
-      });
-    }
-  }
-  
+  // Bind device if provided
   if (deviceId) {
-    license.deviceId = hashDeviceId(deviceId);
+    const hashedDeviceId = hashDeviceId(deviceId);
+    
+    // Check if already bound to different device
+    if (license.deviceId && license.deviceId !== hashedDeviceId) {
+      return res.status(400).json({ success: false, message: 'Mã đã dùng trên thiết bị khác' });
+    }
+    
+    license.deviceId = hashedDeviceId;
+    deviceLicenses.set(hashedDeviceId, trimmedKey);
   }
+  
   license.status = 'used';
   license.activatedAt = new Date().toISOString();
   licenses.set(trimmedKey, license);
   
-  res.json({
-    success: true,
-    message: 'OK',
-    expiryDate: license.expiryDate
-  });
+  res.json({ success: true, expiryDate: license.expiryDate });
 });
 
 // ============================================
@@ -444,7 +412,15 @@ app.post('/api/activate-license', (req, res) => {
 app.get('/api/admin/debug', (req, res) => {
   res.json({
     payments: Array.from(payments.entries()),
-    licenses: Array.from(licenses.entries()),
+    licenses: Array.from(licenses.entries()).map(([k, v]) => ({
+      key: k,
+      ...v,
+      deviceId: v.deviceId ? v.deviceId.substring(0, 16) + '...' : null
+    })),
+    deviceBindings: Array.from(deviceLicenses.entries()).map(([k, v]) => ({
+      deviceId: k.substring(0, 16) + '...',
+      licenseKey: v
+    })),
     timestamp: new Date().toISOString()
   });
 });
@@ -454,4 +430,13 @@ app.get('/api/admin/debug', (req, res) => {
 // ============================================
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
+  console.log('📝 Endpoints:');
+  console.log('   POST /api/create-payment');
+  console.log('   POST /api/payos-webhook');
+  console.log('   GET  /api/get-license/:orderId');
+  console.log('   POST /api/bind-device');
+  console.log('   POST /api/check-device-license');
+  console.log('   POST /api/activate-license');
+  console.log('   GET  /api/payment-success');
+  console.log('   GET  /api/admin/debug');
 });
